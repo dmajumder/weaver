@@ -70,7 +70,7 @@ conda activate weaver
 pip install numpy pandas scikit-learn scipy matplotlib tqdm PyYAML
 
 # install uproot for reading/writing ROOT files
-pip install uproot lz4 xxhash
+pip install uproot3 awkward0 lz4 xxhash
 
 # install PyTables if using HDF5 files
 pip install tables

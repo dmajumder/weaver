@@ -75,7 +75,9 @@ def _get_reweight_indices(weights, up_sample=True, max_resample=10, weight_scale
 
 def _preprocess(table, data_config, options):
     # apply selection
-    _apply_selection(table, data_config.selection if options['training'] else data_config.test_time_selection)
+    entries = _apply_selection(table, data_config.selection if options['training'] else data_config.test_time_selection)
+    if entries == 0:
+        return []
     # define new variables
     _build_new_variables(table, data_config.var_funcs)
     # build weights
@@ -129,8 +131,9 @@ class _SimpleIter(object):
 
         if self._sampler_options['shuffle']:
             np.random.shuffle(filelist)
-        if self._dilation > 1:
-            filelist = filelist[::self._dilation]
+        if self._file_fraction < 1:
+            num_files = int(len(filelist) * self._file_fraction)
+            filelist = filelist[:num_files]
         self.filelist = filelist
 
         if self._init_load_range_and_fraction is None:
@@ -144,10 +147,10 @@ class _SimpleIter(object):
             else:
                 self.load_range = (start_pos, start_pos + interval)
 
-        _logger.debug('Init iter [%d], will load %d (out of %d) files with load_range=%s:\n%s',
+        _logger.debug('Init iter [%d], will load %d (out of %d*%s=%d) files with load_range=%s:\n%s',
                       0 if worker_info is None else worker_info.id,
                       len(self.filelist),
-                      len(self._init_filelist) // self._dilation,
+                      len(self._init_filelist), self._file_fraction, int(len(self._init_filelist) * self._file_fraction),
                       str(self.load_range),
                       '\n'.join(self.filelist[:3]) + '\n ... ' + self.filelist[-1],
                       )
@@ -167,19 +170,23 @@ class _SimpleIter(object):
         try:
             i = self.indices[self.cursor]
         except IndexError:
-            if self.prefetch is None:
-                # reaching the end as prefetch got nothing
-                self.table = None
+            while True:
+                if self.prefetch is None:
+                    # reaching the end as prefetch got nothing
+                    self.table = None
+                    if self._async_load:
+                        self.executor.shutdown(wait=False)
+                    raise StopIteration
+                # get result from prefetch
                 if self._async_load:
-                    self.executor.shutdown(wait=False)
-                raise StopIteration
-            # get result from prefetch
-            if self._async_load:
-                self.table, self.indices = self.prefetch.result()
-            else:
-                self.table, self.indices = self.prefetch
-            # try to load the next ones asynchronously
-            self._try_get_next()
+                    self.table, self.indices = self.prefetch.result()
+                else:
+                    self.table, self.indices = self.prefetch
+                # try to load the next ones asynchronously
+                self._try_get_next()
+                # check if any entries are fetched (i.e., passing selection) -- if not, do another fetch
+                if len(self.indices) > 0:
+                    break
             # reset cursor
             self.cursor = 0
             i = self.indices[self.cursor]
@@ -213,8 +220,8 @@ class _SimpleIter(object):
         X = {k: self.table['_' + k][i].copy() for k in self._data_config.input_names}
         # labels
         y = {k: self.table[k][i].copy() for k in self._data_config.label_names}
-        # observers
-        Z = {k: self.table[k][i].copy() for k in self._data_config.observer_names}
+        # observers / monitor variables
+        Z = {k: self.table[k][i].copy() for k in self._data_config.z_variables}
         return X, y, Z
 
 
@@ -239,11 +246,10 @@ class SimpleIterDataset(torch.utils.data.IterableDataset):
             Event shuffling and reweighting (sampling) is performed each time after we fetch data.
             So set this to a large enough value to avoid getting an imbalanced minibatch (due to reweighting/sampling), especially when ``fetch_by_files`` set to ``True``.
             Will load all events (files) at once if set to non-positive value.
-        dilation (int): file-level reduction factor for file loading.
-            Setting dilation=``d`` will load only ``1`` out of every ``d`` files.
+        file_fraction (float): fraction of files to load.
     """
 
-    def __init__(self, filelist, data_config_file, for_training=True, load_range_and_fraction=None, fetch_by_files=False, fetch_step=0.01, dilation=1,
+    def __init__(self, filelist, data_config_file, for_training=True, load_range_and_fraction=None, fetch_by_files=False, fetch_step=0.01, file_fraction=1,
                  remake_weights=False, up_sample=True, weight_scale=1, max_resample=10, async_load=True):
         _init_args = set(self.__dict__.keys())
         self._init_filelist = filelist if isinstance(filelist, (list, tuple)) else glob.glob(filelist)
@@ -253,7 +259,7 @@ class SimpleIterDataset(torch.utils.data.IterableDataset):
             self._fetch_step = len(filelist) if fetch_by_files else 1.
         else:
             self._fetch_step = fetch_step
-        self._dilation = dilation
+        self._file_fraction = file_fraction
         self._async_load = async_load
 
         # ==== sampling parameters ====
